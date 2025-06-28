@@ -199,7 +199,7 @@ def swap_tokens(request: SwapRequest):
     """
 
     # Determine input and output mint addresses from symbols or addresses
-    def resolve_token(token_str: str) -> (str, int):
+    def resolve_token(token_str: str) -> tuple[str, int]:
         """Helper to resolve a token symbol/name/address to a mint address and decimals."""
         token_str = token_str.strip()
         if not token_str:
