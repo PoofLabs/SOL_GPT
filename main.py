@@ -2,7 +2,8 @@ import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Tuple
+import json
 
 import requests
 import base64
@@ -15,21 +16,25 @@ from solders import message  # Used for obtaining transaction message bytes for 
 from solana.rpc.api import Client
 from solana.rpc.types import TxOpts
 from solana.rpc.commitment import Processed
+from solders.pubkey import Pubkey
 
 from dotenv import load_dotenv
+from decimal import Decimal, getcontext
 
 # Load environment variables (e.g., RPC_URL, PRIVATE_KEY) from a .env file if present
 load_dotenv()
 
+# Set decimal precision for token calculations
+getcontext().prec = 20
+
 # Configuration from environment
 RPC_URL = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
 PRIVATE_KEY_STR = os.environ.get("PRIVATE_KEY")  # Base58-encoded or JSON-array string of 64-byte private key
-# We will derive the Keypair and public key below if PRIVATE_KEY is provided
 
 # Initialize FastAPI app
 app = FastAPI(title="Solana Token API", description="Query token info and perform token swaps on Solana.")
 
-# (Optional) Enable CORS if needed for web clients (allow all origins here for simplicity)
+# Enable CORS if needed for web clients
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,81 +58,135 @@ class SwapRequest(BaseModel):
     amount: float      # amount of input token (in human-readable units, e.g., 1.5 means 1.5 tokens)
     slippage_bps: int = 50  # slippage in basis points (default 50 = 0.5% slippage)
 
-# Pre-load the Solana token list (to support symbol/name queries for even obscure tokens)
-TOKEN_LIST_URL = "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json"
+# Global variables for token data and client setup
 tokens_data = []
-try:
-    resp = requests.get(TOKEN_LIST_URL, timeout=10)
-    resp.raise_for_status()
-    token_list_json = resp.json()
-    tokens_data = token_list_json.get("tokens", [])
-except Exception as e:
-    # If the token list fails to load, we proceed with an empty list and rely on on-chain queries for info
-    print(f"Warning: Could not load token list: {e}")
-
-# Filter tokens for Solana mainnet (chainId 101) and index them by symbol and address for quick lookup
-mainnet_tokens = [t for t in tokens_data if t.get("chainId") == 101]
-# Create lookup dictionaries for symbol->list of tokens and address->token
+mainnet_tokens = []
 tokens_by_symbol = {}
 tokens_by_address = {}
-for token in mainnet_tokens:
-    symbol = token.get("symbol")
-    address = token.get("address")
-    if symbol:
-        symbol_upper = symbol.upper()
-        tokens_by_symbol.setdefault(symbol_upper, []).append(token)
-    if address:
-        tokens_by_address[address] = token
-
-# Prepare Solana RPC client and Keypair if private key is provided
-solana_client = Client(endpoint=RPC_URL)
+solana_client = None
 solana_keypair = None
 solana_pubkey_str = None
-if PRIVATE_KEY_STR:
-    try:
-        # If the private key is in JSON array format (e.g., "[18, 54, ...]"), parse it
-        if PRIVATE_KEY_STR.strip().startswith("["):
-            key_array = list(map(int, PRIVATE_KEY_STR.strip().strip("[]").split(",")))
-            solana_keypair = Keypair.from_bytes(bytes(key_array))
-        else:
-            # Assume the private key is a base58-encoded secret key
-            solana_keypair = Keypair.from_bytes(base58.b58decode(PRIVATE_KEY_STR))
-    except Exception as e:
-        # If key parsing fails, raise an error at startup (so deployment fails fast rather than at swap time)
-        raise RuntimeError("Failed to parse PRIVATE_KEY from environment. Please provide a valid Solana private key.") from e
 
-    # Derive the public key (string) from the Keypair
-    solana_pubkey_str = str(solana_keypair.pubkey())
-    # Log (or print) to verify loaded key (avoid printing the actual private key)
-    print(f"Loaded wallet public key: {solana_pubkey_str}")
+def initialize_token_list():
+    """Load and process token list data"""
+    global tokens_data, mainnet_tokens, tokens_by_symbol, tokens_by_address
+    
+    TOKEN_LIST_URL = "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json"
+    try:
+        resp = requests.get(TOKEN_LIST_URL, timeout=10)
+        resp.raise_for_status()
+        token_list_json = resp.json()
+        tokens_data = token_list_json.get("tokens", [])
+        print(f"Loaded {len(tokens_data)} tokens from token list")
+    except Exception as e:
+        print(f"Warning: Could not load token list: {e}")
+        return
+
+    # Filter tokens for Solana mainnet (chainId 101) and index them
+    mainnet_tokens = [t for t in tokens_data if t.get("chainId") == 101]
+    
+    # Create lookup dictionaries
+    for token in mainnet_tokens:
+        symbol = token.get("symbol")
+        address = token.get("address")
+        if symbol:
+            symbol_upper = symbol.upper()
+            tokens_by_symbol.setdefault(symbol_upper, []).append(token)
+        if address:
+            tokens_by_address[address] = token
+    
+    print(f"Indexed {len(mainnet_tokens)} mainnet tokens")
+
+def initialize_solana_client():
+    """Initialize Solana client and keypair"""
+    global solana_client, solana_keypair, solana_pubkey_str
+    
+    # Initialize Solana RPC client
+    solana_client = Client(endpoint=RPC_URL)
+    print(f"Initialized Solana client with RPC: {RPC_URL}")
+    
+    # Initialize keypair if private key is provided
+    if PRIVATE_KEY_STR:
+        try:
+            # Handle JSON array format
+            if PRIVATE_KEY_STR.strip().startswith("["):
+                key_data = json.loads(PRIVATE_KEY_STR.strip())
+                if not isinstance(key_data, list) or len(key_data) != 64:
+                    raise ValueError("Private key array must contain exactly 64 integers")
+                solana_keypair = Keypair.from_bytes(bytes(key_data))
+            else:
+                # Handle base58 encoded format
+                decoded_key = base58.b58decode(PRIVATE_KEY_STR)
+                if len(decoded_key) != 64:
+                    raise ValueError("Private key must be 64 bytes")
+                solana_keypair = Keypair.from_bytes(decoded_key)
+            
+            solana_pubkey_str = str(solana_keypair.pubkey())
+            print(f"Loaded wallet public key: {solana_pubkey_str}")
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse PRIVATE_KEY from environment: {e}")
+    else:
+        print("No private key provided - swap transactions will be returned unsigned")
+
+def is_valid_solana_address(address: str) -> bool:
+    """Validate if a string is a valid Solana address"""
+    try:
+        decoded = base58.b58decode(address)
+        return len(decoded) == 32
+    except Exception:
+        return False
+
+def get_token_decimals_from_chain(mint_address: str) -> Optional[int]:
+    """Fetch token decimals from chain"""
+    try:
+        # Use the correct method to get mint info
+        mint_pubkey = Pubkey.from_string(mint_address)
+        mint_info = solana_client.get_account_info(mint_pubkey)
+        
+        if mint_info.value is None:
+            return None
+            
+        # Parse mint account data to get decimals (byte 44 contains decimals)
+        account_data = mint_info.value.data
+        if len(account_data) >= 45:
+            return int(account_data[44])
+        
+        return None
+    except Exception as e:
+        print(f"Error fetching decimals for {mint_address}: {e}")
+        return None
+
+# Initialize everything at startup
+initialize_token_list()
+initialize_solana_client()
+
+@app.get("/")
+def root():
+    """Health check endpoint"""
+    return {
+        "status": "ok",
+        "message": "Solana Token API is running",
+        "tokens_loaded": len(mainnet_tokens),
+        "wallet_configured": solana_keypair is not None
+    }
 
 @app.get("/token", response_model=List[TokenInfo])
 def get_token_info(query: str):
     """
     Query Solana token information by symbol, name, or mint address.
-    - `query`: Token symbol (e.g. "SOL"), token name (e.g. "Wrapped Solana"), or mint address.
-    Returns a list of matching tokens (could be multiple if name matches several), or 404 if none found.
     """
     query_str = query.strip()
     if not query_str:
         raise HTTPException(status_code=400, detail="Query parameter is required.")
 
-    # Determine if query is a mint address (base58) or a token symbol/name.
     token_matches: List[TokenInfo] = []
-    is_address = False
-    # Heuristic: if query is valid base58 and decodes to 32 bytes, treat it as a mint address
-    try:
-        decoded = base58.b58decode(query_str)
-        if len(decoded) == 32:
-            is_address = True
-    except Exception:
-        is_address = False
-
-    if is_address:
-        # Exact address lookup
+    
+    # Check if query is a valid Solana address
+    if is_valid_solana_address(query_str):
+        # Look up by address
         token = tokens_by_address.get(query_str)
         if token:
-            # Found in token list
             token_matches.append(TokenInfo(**{
                 "symbol": token.get("symbol"),
                 "name": token.get("name"),
@@ -137,33 +196,23 @@ def get_token_info(query: str):
                 "tags": token.get("tags")
             }))
         else:
-            # Not found in static list, attempt on-chain lookup for decimals (name/symbol might not be available)
-            try:
-                supply_info = solana_client.get_token_supply(query_str)
-                value = supply_info.get("result", {}).get("value")
-                if value and "decimals" in value:
-                    decimals = value["decimals"]
-                else:
-                    # If RPC response doesn't contain decimals, we cannot retrieve info
-                    decimals = None
-            except Exception as e:
-                raise HTTPException(status_code=404, detail="Token mint address not found or invalid.") from e
-
-            token_matches.append(TokenInfo(**{
-                "symbol": None,
-                "name": None,
-                "address": query_str,
-                "decimals": decimals,
-                "logoURI": None,
-                "tags": None
-            }))
+            # Try to get decimals from chain
+            decimals = get_token_decimals_from_chain(query_str)
+            if decimals is not None:
+                token_matches.append(TokenInfo(**{
+                    "symbol": None,
+                    "name": None,
+                    "address": query_str,
+                    "decimals": decimals,
+                    "logoURI": None,
+                    "tags": None
+                }))
+            else:
+                raise HTTPException(status_code=404, detail="Token mint address not found or invalid.")
     else:
-        # Not an address: treat query as symbol or name (case-insensitive exact match)
+        # Search by symbol (case-insensitive)
         q_upper = query_str.upper()
-        q_lower = query_str.lower()
-        # Try symbol exact match (case-insensitive)
         if q_upper in tokens_by_symbol:
-            # If multiple tokens share the same symbol, include them all
             for token in tokens_by_symbol[q_upper]:
                 token_matches.append(TokenInfo(**{
                     "symbol": token.get("symbol"),
@@ -174,7 +223,8 @@ def get_token_info(query: str):
                     "tags": token.get("tags")
                 }))
         else:
-            # Try name exact match (case-insensitive)
+            # Search by name (case-insensitive)
+            q_lower = query_str.lower()
             for token in mainnet_tokens:
                 if token.get("name") and token.get("name").lower() == q_lower:
                     token_matches.append(TokenInfo(**{
@@ -187,77 +237,82 @@ def get_token_info(query: str):
                     }))
 
     if not token_matches:
-        # No token found for the query
         raise HTTPException(status_code=404, detail="Token not found.")
+    
     return token_matches
+
+def resolve_token(token_str: str) -> Tuple[str, int]:
+    """Helper to resolve a token symbol/name/address to a mint address and decimals."""
+    token_str = token_str.strip()
+    if not token_str:
+        raise HTTPException(status_code=400, detail="Token identifier cannot be empty.")
+    
+    # Check if it's a known symbol
+    token_info_list = tokens_by_symbol.get(token_str.upper())
+    if token_info_list:
+        if len(token_info_list) > 1:
+            symbols_info = [f"{t['symbol']} ({t['address']})" for t in token_info_list]
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Symbol '{token_str}' is ambiguous. Multiple tokens found: {', '.join(symbols_info)}. Please use the mint address instead."
+            )
+        token_info = token_info_list[0]
+        return token_info["address"], token_info.get("decimals", 0)
+    
+    # Check if it's a valid address
+    if is_valid_solana_address(token_str):
+        # Check if we have it in our token list
+        if token_str in tokens_by_address:
+            decimals = tokens_by_address[token_str].get("decimals")
+        else:
+            # Try to get decimals from chain
+            decimals = get_token_decimals_from_chain(token_str)
+        
+        if decimals is None:
+            decimals = 0  # Default to 0 if we can't determine decimals
+            
+        return token_str, decimals
+    
+    # Token not found
+    raise HTTPException(status_code=404, detail=f"Token '{token_str}' not found. Please use a valid symbol or mint address.")
 
 @app.post("/swap")
 def swap_tokens(request: SwapRequest):
     """
     Perform a token swap from input_token to output_token using Jupiter aggregator.
-    Expects a JSON body with:
-    {
-      "input_token": "<symbol or mint address>",
-      "output_token": "<symbol or mint address>",
-      "amount": <float amount of input token>,
-      "slippage_bps": <int slippage in basis points>
-    }
-    Returns the transaction signature (ID) after sending the swap, or the unsigned swap transaction if no private key is configured.
     """
-    # Determine input and output mint addresses from symbols or addresses
-    def resolve_token(token_str: str) -> (str, int):
-        """Helper to resolve a token symbol/name/address to a mint address and decimals."""
-        token_str = token_str.strip()
-        if not token_str:
-            raise HTTPException(status_code=400, detail="Token identifier cannot be empty.")
-        # Check if it's a known symbol
-        token_info_list = tokens_by_symbol.get(token_str.upper())
-        if token_info_list:
-            # If multiple tokens share the symbol, require unambiguous input
-            if len(token_info_list) > 1:
-                raise HTTPException(status_code=400, detail=f"Symbol '{token_str}' is ambiguous, please use the mint address instead.")
-            token_info = token_info_list[0]
-            return token_info["address"], token_info.get("decimals", 0)
-        # If not a symbol, maybe it's an address (or name, but we'll assume direct address for swap)
-        try:
-            decoded = base58.b58decode(token_str)
-            if len(decoded) == 32:
-                # It's a valid 32-byte address. Check if we know its decimals from list or chain.
-                decimals = None
-                if token_str in tokens_by_address:
-                    decimals = tokens_by_address[token_str].get("decimals", None)
-                if decimals is None:
-                    # Fetch decimals via RPC if not in list
-                    try:
-                        supply_info = solana_client.get_token_supply(token_str)
-                        value = supply_info.get("result", {}).get("value")
-                        if value and "decimals" in value:
-                            decimals = value["decimals"]
-                    except Exception:
-                        # If this fails, we'll just set decimals as 0 (to avoid crash; the swap might fail if incorrect)
-                        decimals = 0
-                return token_str, decimals if decimals is not None else 0
-        except Exception:
-            # Not a valid base58 address
-            pass
-        # If we reach here, the token_str was not resolved
-        raise HTTPException(status_code=404, detail=f"Token '{token_str}' not found. Please use a valid symbol or mint address.")
-
-    input_address, input_decimals = resolve_token(request.input_token)
-    output_address, output_decimals = resolve_token(request.output_token)
-
-    # Calculate the input amount in the smallest units (lamports for SOL or minor units for SPL tokens)
-    if input_decimals is None:
-        input_decimals = 0  # If still None, treat as 0 to avoid errors (though this is unlikely if token exists)
-    # Use Decimal for precise multiplication to avoid floating-point issues
-    from decimal import Decimal, getcontext
-    getcontext().prec = 20  # sufficient precision for token amounts
-    amount_decimal = Decimal(str(request.amount))
-    amount_in_base_units = int(amount_decimal * (Decimal(10) ** input_decimals))
-    if amount_in_base_units <= 0:
-        raise HTTPException(status_code=400, detail="Amount is too small or invalid for the given token decimals.")
-
-    # Prepare the Jupiter quote API request
+    if not solana_client:
+        raise HTTPException(status_code=500, detail="Solana client not initialized")
+    
+    # Validate request
+    if request.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than 0")
+    
+    if request.slippage_bps < 0 or request.slippage_bps > 10000:
+        raise HTTPException(status_code=400, detail="Slippage must be between 0 and 10000 basis points (0-100%)")
+    
+    # Resolve input and output tokens
+    try:
+        input_address, input_decimals = resolve_token(request.input_token)
+        output_address, output_decimals = resolve_token(request.output_token)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error resolving tokens: {e}")
+    
+    if input_address == output_address:
+        raise HTTPException(status_code=400, detail="Input and output tokens cannot be the same")
+    
+    # Calculate amount in base units with proper precision
+    try:
+        amount_decimal = Decimal(str(request.amount))
+        amount_in_base_units = int(amount_decimal * (Decimal(10) ** input_decimals))
+        if amount_in_base_units <= 0:
+            raise HTTPException(status_code=400, detail="Amount is too small for the given token decimals")
+    except (ValueError, OverflowError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid amount: {e}")
+    
+    # Get quote from Jupiter
     quote_url = (
         f"https://quote-api.jup.ag/v6/quote"
         f"?inputMint={input_address}"
@@ -266,97 +321,101 @@ def swap_tokens(request: SwapRequest):
         f"&slippageBps={request.slippage_bps}"
         f"&swapMode=ExactIn"
     )
+    
     try:
-        quote_resp = requests.get(quote_url, timeout=10)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch quote from Jupiter: {e}")
-    if quote_resp.status_code != 200:
-        # Forward the error from Jupiter if available
-        detail_msg = f"Jupiter quote API error (status {quote_resp.status_code})"
-        try:
-            error_body = quote_resp.json()
-            # If Jupiter provided an error message, include it
-            if isinstance(error_body, dict) and error_body.get("error"):
-                detail_msg += f" - {error_body.get('error')}"
-        except ValueError:
-            # Not JSON
-            detail_msg += f" - {quote_resp.text[:200]}"
-        raise HTTPException(status_code=502, detail=detail_msg)
-    # Parse quote response JSON
-    quote_data = quote_resp.json()
-    # If no route found or output amount is zero, handle as error
-    out_amt = quote_data.get("outAmount")
-    if out_amt is None or int(out_amt) == 0:
-        raise HTTPException(status_code=400, detail="No swap route found or output amount is zero. Swap cannot be performed.")
-
-    # Prepare the swap API request payload
-    payload = {
+        quote_resp = requests.get(quote_url, timeout=15)
+        quote_resp.raise_for_status()
+        quote_data = quote_resp.json()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Failed to get quote from Jupiter: {e}")
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"Invalid response from Jupiter quote API: {e}")
+    
+    # Validate quote response
+    if "error" in quote_data:
+        raise HTTPException(status_code=400, detail=f"Jupiter quote error: {quote_data['error']}")
+    
+    out_amount = quote_data.get("outAmount")
+    if not out_amount or int(out_amount) == 0:
+        raise HTTPException(status_code=400, detail="No swap route found or output amount is zero")
+    
+    # Get swap transaction from Jupiter
+    user_pubkey = solana_pubkey_str if solana_pubkey_str else "11111111111111111111111111111112"  # System program as placeholder
+    
+    swap_payload = {
         "quoteResponse": quote_data,
-        "userPublicKey": solana_pubkey_str if solana_pubkey_str else "INSERT_PUBLIC_KEY_HERE",
-        "wrapAndUnwrapSol": True  # auto wrap/unwrap SOL if SOL is involved
+        "userPublicKey": user_pubkey,
+        "wrapAndUnwrapSol": True,
+        "computeUnitPriceMicroLamports": "auto"  # Let Jupiter set compute price
     }
+    
     try:
-        swap_resp = requests.post("https://quote-api.jup.ag/v6/swap", json=payload, timeout=10)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch swap transaction from Jupiter: {e}")
-    if swap_resp.status_code != 200:
-        detail_msg = f"Jupiter swap API error (status {swap_resp.status_code})"
-        try:
-            err_json = swap_resp.json()
-            if isinstance(err_json, dict) and err_json.get("error"):
-                detail_msg += f" - {err_json.get('error')}"
-        except ValueError:
-            detail_msg += f" - {swap_resp.text[:200]}"
-        raise HTTPException(status_code=502, detail=detail_msg)
-    swap_result = swap_resp.json()
+        swap_resp = requests.post(
+            "https://quote-api.jup.ag/v6/swap", 
+            json=swap_payload, 
+            timeout=15,
+            headers={"Content-Type": "application/json"}
+        )
+        swap_resp.raise_for_status()
+        swap_result = swap_resp.json()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Failed to get swap transaction from Jupiter: {e}")
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=f"Invalid response from Jupiter swap API: {e}")
+    
+    if "error" in swap_result:
+        raise HTTPException(status_code=400, detail=f"Jupiter swap error: {swap_result['error']}")
+    
     swap_tx_b64 = swap_result.get("swapTransaction")
     if not swap_tx_b64:
-        raise HTTPException(status_code=500, detail="Failed to retrieve swap transaction from Jupiter.")
-
-    # If no private key configured on the server, return the unsigned transaction for the user to sign
+        raise HTTPException(status_code=500, detail="Failed to retrieve swap transaction from Jupiter")
+    
+    # If no private key configured, return unsigned transaction
     if solana_keypair is None:
-        return {"swap_transaction": swap_tx_b64, "message": "No server signing key configured. Please sign this transaction and send it to the Solana network."}
-
-    # Sign the transaction using the server's Keypair
+        return {
+            "swap_transaction": swap_tx_b64,
+            "message": "No server signing key configured. Please sign this transaction and send it to the Solana network.",
+            "quote_info": {
+                "input_amount": str(request.amount),
+                "output_amount": str(Decimal(out_amount) / (Decimal(10) ** output_decimals)),
+                "input_token": input_address,
+                "output_token": output_address
+            }
+        }
+    
+    # Sign and send transaction
     try:
+        # Decode and create versioned transaction
         raw_tx_bytes = base64.b64decode(swap_tx_b64)
-        raw_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
-        # Obtain the message bytes for signing (for versioned transactions)
-        msg_bytes = message.to_bytes_versioned(raw_tx.message)
-        # Sign the message bytes with our private key
-        signature = solana_keypair.sign_message(msg_bytes)
-        # Create a signed transaction using the original message and the signature
-        signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to sign the transaction: {e}")
-
-    # Send the signed transaction to the Solana RPC node
-    try:
+        versioned_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
+        
+        # Sign the transaction
+        versioned_tx.sign([solana_keypair])
+        
+        # Send transaction
         opts = TxOpts(skip_preflight=False, preflight_commitment=Processed)
-        result = solana_client.send_raw_transaction(bytes(signed_tx), opts=opts)
-        # The result might be an RPC response object; convert to dict if needed
-        if hasattr(result, "to_json"):
-            result_json = result.to_json()
+        result = solana_client.send_raw_transaction(bytes(versioned_tx), opts=opts)
+        
+        # Extract transaction signature
+        if hasattr(result, 'value'):
+            tx_signature = str(result.value)
         else:
-            # If already a dict or similar, use it directly
-            result_json = result
-        tx_result = result_json if isinstance(result_json, dict) else {}
+            tx_signature = str(result)
+        
+        return {
+            "transaction_id": tx_signature,
+            "explorer_url": f"https://explorer.solana.com/tx/{tx_signature}",
+            "quote_info": {
+                "input_amount": str(request.amount),
+                "output_amount": str(Decimal(out_amount) / (Decimal(10) ** output_decimals)),
+                "input_token": input_address,
+                "output_token": output_address
+            }
+        }
+        
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to send transaction to Solana network: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to sign or send transaction: {e}")
 
-    # Extract transaction signature (ID) from the RPC response
-    tx_signature = None
-    if "result" in tx_result and tx_result["result"]:
-        tx_signature = tx_result["result"]
-    elif "error" in tx_result and tx_result["error"]:
-        # RPC node returned an error
-        raise HTTPException(status_code=502, detail=f"Solana RPC error: {tx_result['error']}")
-    else:
-        # Unexpected response format
-        raise HTTPException(status_code=502, detail="Unknown error from Solana RPC.")
-
-    # Return the transaction signature (and an explorer link for convenience)
-    return {
-        "transaction_id": tx_signature,
-        "explorer_url": f"https://explorer.solana.com/tx/{tx_signature}"
-    }
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
