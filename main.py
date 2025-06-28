@@ -1,7 +1,6 @@
 import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-# Note: JSONResponse import removed as it was not used
 import requests
 from typing import List, Optional
 from pydantic import BaseModel
@@ -16,11 +15,16 @@ SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.co
 WSOL_MINT = "So11111111111111111111111111111111111111112"  # Wrapped SOL mint address
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC mint address (Solana)
 
+# Determine the base URL for the API (for OpenAPI schema `servers`)
+PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # Expected to be like "https://your-domain.com"
+# If PUBLIC_URL is not set, default to root path (suitable for local testing, but not valid for plugin)
+servers_config = [{"url": PUBLIC_URL or "/"}]
+
 app = FastAPI(
     title="SolanaGPT API",
     description="API for Solana-based utilities such as token prices, wallet balances, and token swaps.",
     version="1.0.0",
-    servers=[{"url": "/"}]  # Use relative root path for OpenAPI (important for Railway deployment)
+    servers=servers_config  # Use an absolute URL in production for OpenAPI schema:contentReference[oaicite:6]{index=6}:contentReference[oaicite:7]{index=7}
 )
 
 # Enable CORS for all origins (adjust in production as needed)
@@ -319,4 +323,4 @@ def get_swap_quote(input_mint: str, output_mint: str, amount: float, slippage_bp
     ui_out = "SOL" if out_mint == WSOL_MINT else out_mint
     result["swap_link"] = (f"https://jup.ag/swap?inputMint={ui_in}&outputMint={ui_out}"
                            f"&amount={amount}&slippage={slippage_bps/100:.2f}")
-    return result
+    return result  # Return the assembled quote result (dict)
