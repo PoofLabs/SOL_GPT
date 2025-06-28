@@ -362,23 +362,35 @@ def swap_tokens(request: SwapRequest):
     }
 
 
-# Swagger docs fix for OpenAPI compatibility
-from fastapi.openapi.utils import get_openapi
-
 @app.get("/")
 def root():
     return {"message": "SolanaGPT backend is running."}
 
+# Fixed OpenAPI schema generation
+from fastapi.openapi.utils import get_openapi
+
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
+    
     openapi_schema = get_openapi(
         title=app.title,
-        version=app.version,
+        version="1.0.0",
         description=app.description,
         routes=app.routes,
-        servers=[{"url": "/"}]
     )
+    
+    # Remove the problematic servers configuration or set it properly
+    # Option 1: Remove servers entirely (let it use default)
+    if "servers" in openapi_schema:
+        del openapi_schema["servers"]
+    
+    # Option 2: Set proper server URLs (uncomment if you want to specify servers)
+    # openapi_schema["servers"] = [
+    #     {"url": "http://localhost:8000", "description": "Development server"},
+    #     {"url": "https://your-production-domain.com", "description": "Production server"}
+    # ]
+    
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 
@@ -386,4 +398,4 @@ app.openapi = custom_openapi
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main-4:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
