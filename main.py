@@ -10,6 +10,7 @@ import requests
 import base64
 import base58
 import json
+import logging
 
 # Solana SDK imports
 from solders.keypair import Keypair
@@ -32,19 +33,16 @@ API_BASE_URL = os.environ.get("API_BASE_URL", "https://sol-gpt.onrender.com")
 # Set decimal precision
 getcontext().prec = 20
 
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Initialize FastAPI app
 app = FastAPI(
     title="Solana Token API",
     description="Query Solana wallet, token info, and perform token swaps.",
     version="1.0.0"
 )
-
-# Add the OpenAPI schema URL
-@app.get("/openapi.json")
-async def get_openapi():
-    openapi_schema = app.openapi()
-    openapi_schema["servers"] = [{"url": API_BASE_URL}]
-    return openapi_schema
 
 # Enable CORS
 app.add_middleware(
@@ -87,7 +85,12 @@ class PriceInfo(BaseModel):
     volume_24h: Optional[float] = None
 
 # Initialize Solana client
-solana_client = Client(endpoint=RPC_URL)
+try:
+    solana_client = Client(endpoint=RPC_URL)
+    logger.info(f"Connected to Solana RPC: {RPC_URL}")
+except Exception as e:
+    logger.error(f"Failed to connect to Solana RPC: {e}")
+    solana_client = None
 
 # Load token list
 TOKEN_LIST_URL = "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json"
@@ -97,7 +100,7 @@ tokens_by_symbol = {}
 tokens_by_address = {}
 
 try:
-    print("Loading token list...")
+    logger.info("Loading token list...")
     resp = requests.get(TOKEN_LIST_URL, timeout=10)
     resp.raise_for_status()
     token_list_json = resp.json()
@@ -115,9 +118,9 @@ try:
         if address:
             tokens_by_address[address] = token
             
-    print(f"Loaded {len(mainnet_tokens)} mainnet tokens")
+    logger.info(f"Loaded {len(mainnet_tokens)} mainnet tokens")
 except Exception as e:
-    print(f"Warning: Could not load token list: {e}")
+    logger.warning(f"Could not load token list: {e}")
 
 # Initialize keypair
 solana_keypair = None
@@ -135,9 +138,9 @@ if PRIVATE_KEY_STR:
             solana_keypair = Keypair.from_bytes(base58.b58decode(PRIVATE_KEY_STR))
         
         solana_pubkey_str = str(solana_keypair.pubkey())
-        print(f"Loaded wallet public key: {solana_pubkey_str}")
+        logger.info(f"Loaded wallet public key: {solana_pubkey_str}")
     except Exception as e:
-        print(f"Warning: Failed to parse PRIVATE_KEY: {e}")
+        logger.warning(f"Failed to parse PRIVATE_KEY: {e}")
 
 # Helper functions
 def get_token_price(mint_address: str) -> Optional[float]:
@@ -151,7 +154,7 @@ def get_token_price(mint_address: str) -> Optional[float]:
             if price_data:
                 return price_data.get("price")
     except Exception as e:
-        print(f"Error getting price for {mint_address}: {e}")
+        logger.error(f"Error getting price for {mint_address}: {e}")
     return None
 
 def resolve_token(token_str: str) -> tuple[str, int]:
@@ -163,10 +166,6 @@ def resolve_token(token_str: str) -> tuple[str, int]:
     # Check symbol first
     token_info_list = tokens_by_symbol.get(token_str.upper())
     if token_info_list:
-        if len(token_info_list) > 1:
-            # For ambiguous symbols, prefer the most common one
-            # You could add logic here to prefer certain tokens
-            pass
         token = token_info_list[0]
         return token["address"], token.get("decimals", 0)
     
@@ -178,7 +177,7 @@ def resolve_token(token_str: str) -> tuple[str, int]:
             if token_str in tokens_by_address:
                 decimals = tokens_by_address[token_str].get("decimals")
             
-            if decimals is None:
+            if decimals is None and solana_client:
                 try:
                     supply_resp = solana_client.get_token_supply(token_str)
                     if isinstance(supply_resp, dict):
@@ -187,7 +186,7 @@ def resolve_token(token_str: str) -> tuple[str, int]:
                 except Exception:
                     decimals = 0
             
-            return token_str, decimals
+            return token_str, decimals or 0
     except Exception:
         pass
     
@@ -195,9 +194,6 @@ def resolve_token(token_str: str) -> tuple[str, int]:
     q_lower = token_str.lower()
     name_matches = [t for t in mainnet_tokens if t.get("name") and t.get("name").lower() == q_lower]
     if name_matches:
-        if len(name_matches) > 1:
-            # Use the first match
-            pass
         token = name_matches[0]
         return token["address"], token.get("decimals", 0)
     
@@ -216,71 +212,51 @@ async def root():
             "token_price": "/price/{token}",
             "wallet_info": "/wallet",
             "wallet_check": "/wallet/{address}",
-            "swap": "/swap (POST)"
+            "swap": "/swap (POST)",
+            "openapi": "/openapi.json"
         }
     }
     if solana_pubkey_str:
         info["configured_wallet"] = solana_pubkey_str
     return info
 
+@app.get("/openapi.json")
+async def get_openapi():
+    """Get OpenAPI schema"""
+    openapi_schema = app.openapi()
+    # Force the correct server URL
+    openapi_schema["servers"] = [
+        {
+            "url": "https://sol-gpt.onrender.com",
+            "description": "Production server"
+        }
+    ]
+    return openapi_schema
+
 @app.get("/token", response_model=List[TokenInfo])
 async def get_token_info(query: str):
     """Get token information by symbol, name, or mint address"""
-    query_str = query.strip()
-    if not query_str:
-        raise HTTPException(status_code=400, detail="Query parameter is required.")
-    
-    token_matches: List[TokenInfo] = []
-    
-    # Check if query is an address
-    is_address = False
     try:
-        decoded = base58.b58decode(query_str)
-        if len(decoded) == 32:
-            is_address = True
-    except Exception:
-        is_address = False
-    
-    if is_address:
-        # Exact address lookup
-        token = tokens_by_address.get(query_str)
-        if token:
-            price = get_token_price(query_str)
-            token_matches.append(TokenInfo(
-                symbol=token.get("symbol"),
-                name=token.get("name"),
-                address=token.get("address"),
-                decimals=token.get("decimals"),
-                logoURI=token.get("logoURI"),
-                tags=token.get("tags"),
-                price_usd=price
-            ))
-        else:
-            # Try on-chain lookup
-            try:
-                supply_resp = solana_client.get_token_supply(query_str)
-                decimals = None
-                if isinstance(supply_resp, dict):
-                    value = supply_resp.get("result", {}).get("value", {})
-                    decimals = value.get("decimals")
-                
-                price = get_token_price(query_str)
-                token_matches.append(TokenInfo(
-                    address=query_str,
-                    decimals=decimals,
-                    price_usd=price
-                ))
-            except Exception:
-                raise HTTPException(status_code=404, detail="Token not found.")
-    else:
-        # Symbol or name search
-        q_upper = query_str.upper()
-        q_lower = query_str.lower()
+        query_str = query.strip()
+        if not query_str:
+            raise HTTPException(status_code=400, detail="Query parameter is required.")
         
-        # Try symbol match
-        if q_upper in tokens_by_symbol:
-            for token in tokens_by_symbol[q_upper]:
-                price = get_token_price(token.get("address"))
+        token_matches: List[TokenInfo] = []
+        
+        # Check if query is an address
+        is_address = False
+        try:
+            decoded = base58.b58decode(query_str)
+            if len(decoded) == 32:
+                is_address = True
+        except Exception:
+            is_address = False
+        
+        if is_address:
+            # Exact address lookup
+            token = tokens_by_address.get(query_str)
+            if token:
+                price = get_token_price(query_str)
                 token_matches.append(TokenInfo(
                     symbol=token.get("symbol"),
                     name=token.get("name"),
@@ -290,10 +266,32 @@ async def get_token_info(query: str):
                     tags=token.get("tags"),
                     price_usd=price
                 ))
+            else:
+                # Try on-chain lookup
+                if solana_client:
+                    try:
+                        supply_resp = solana_client.get_token_supply(query_str)
+                        decimals = None
+                        if isinstance(supply_resp, dict):
+                            value = supply_resp.get("result", {}).get("value", {})
+                            decimals = value.get("decimals")
+                        
+                        price = get_token_price(query_str)
+                        token_matches.append(TokenInfo(
+                            address=query_str,
+                            decimals=decimals,
+                            price_usd=price
+                        ))
+                    except Exception:
+                        pass
         else:
-            # Try name match
-            for token in mainnet_tokens:
-                if token.get("name") and token.get("name").lower() == q_lower:
+            # Symbol or name search
+            q_upper = query_str.upper()
+            q_lower = query_str.lower()
+            
+            # Try symbol match
+            if q_upper in tokens_by_symbol:
+                for token in tokens_by_symbol[q_upper]:
                     price = get_token_price(token.get("address"))
                     token_matches.append(TokenInfo(
                         symbol=token.get("symbol"),
@@ -304,11 +302,31 @@ async def get_token_info(query: str):
                         tags=token.get("tags"),
                         price_usd=price
                     ))
-    
-    if not token_matches:
-        raise HTTPException(status_code=404, detail="Token not found.")
-    
-    return token_matches
+            else:
+                # Try name match
+                for token in mainnet_tokens:
+                    if token.get("name") and token.get("name").lower() == q_lower:
+                        price = get_token_price(token.get("address"))
+                        token_matches.append(TokenInfo(
+                            symbol=token.get("symbol"),
+                            name=token.get("name"),
+                            address=token.get("address"),
+                            decimals=token.get("decimals"),
+                            logoURI=token.get("logoURI"),
+                            tags=token.get("tags"),
+                            price_usd=price
+                        ))
+        
+        if not token_matches:
+            raise HTTPException(status_code=404, detail=f"Token '{query_str}' not found.")
+        
+        return token_matches
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in get_token_info: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/price/{token}", response_model=PriceInfo)
 async def get_token_price_info(token: str):
@@ -345,7 +363,8 @@ async def get_token_price_info(token: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching price: {str(e)}")
+        logger.error(f"Error in get_token_price_info: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/wallet", response_model=WalletInfo)
 async def get_configured_wallet_info():
@@ -358,82 +377,91 @@ async def get_configured_wallet_info():
 @app.get("/wallet/{address}", response_model=WalletInfo)
 async def get_wallet_info_by_address(address: str):
     """Get information about any wallet by address"""
-    # Validate address
     try:
-        decoded = base58.b58decode(address)
-        if len(decoded) != 32:
-            raise ValueError("Invalid address length")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid Solana address")
-    
-    # Get SOL balance
-    lamports = None
-    sol_balance = None
-    try:
-        balance_resp = solana_client.get_balance(address)
-        if isinstance(balance_resp, dict):
-            lamports = balance_resp.get("result", {}).get("value")
-        sol_balance = (lamports / 1_000_000_000) if lamports is not None else None
-    except Exception as e:
-        print(f"Error fetching balance: {e}")
-    
-    # Get token accounts
-    token_accounts = []
-    try:
-        # Get all token accounts for this wallet
-        token_accounts_resp = solana_client.get_token_accounts_by_owner(
-            address,
-            opts={"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"}
-        )
+        # Validate address
+        try:
+            decoded = base58.b58decode(address)
+            if len(decoded) != 32:
+                raise ValueError("Invalid address length")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid Solana address")
         
-        if isinstance(token_accounts_resp, dict):
-            accounts = token_accounts_resp.get("result", {}).get("value", [])
+        if not solana_client:
+            raise HTTPException(status_code=503, detail="Solana RPC not available")
+        
+        # Get SOL balance
+        lamports = None
+        sol_balance = None
+        try:
+            balance_resp = solana_client.get_balance(address)
+            if isinstance(balance_resp, dict):
+                lamports = balance_resp.get("result", {}).get("value")
+            sol_balance = (lamports / 1_000_000_000) if lamports is not None else None
+        except Exception as e:
+            logger.error(f"Error fetching balance: {e}")
+        
+        # Get token accounts
+        token_accounts = []
+        try:
+            # Get all token accounts for this wallet
+            token_accounts_resp = solana_client.get_token_accounts_by_owner(
+                address,
+                opts={"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"}
+            )
             
-            for account in accounts:
-                try:
-                    account_data = account.get("account", {}).get("data", {})
-                    parsed_data = account_data.get("parsed", {}).get("info", {})
-                    
-                    if parsed_data:
-                        mint = parsed_data.get("mint")
-                        token_amount = parsed_data.get("tokenAmount", {})
-                        amount = token_amount.get("amount", "0")
-                        decimals = token_amount.get("decimals", 0)
-                        ui_amount = token_amount.get("uiAmount", 0)
+            if isinstance(token_accounts_resp, dict):
+                accounts = token_accounts_resp.get("result", {}).get("value", [])
+                
+                for account in accounts:
+                    try:
+                        account_data = account.get("account", {}).get("data", {})
+                        parsed_data = account_data.get("parsed", {}).get("info", {})
                         
-                        # Skip zero balance tokens
-                        if ui_amount == 0:
-                            continue
-                        
-                        # Get token info
-                        token_info = tokens_by_address.get(mint, {})
-                        
-                        # Get price
-                        price = get_token_price(mint)
-                        value_usd = (ui_amount * price) if price else None
-                        
-                        token_accounts.append({
-                            "mint": mint,
-                            "symbol": token_info.get("symbol"),
-                            "name": token_info.get("name"),
-                            "amount": amount,
-                            "decimals": decimals,
-                            "uiAmount": ui_amount,
-                            "price_usd": price,
-                            "value_usd": value_usd
-                        })
-                except Exception as e:
-                    print(f"Error parsing token account: {e}")
-                    continue
+                        if parsed_data:
+                            mint = parsed_data.get("mint")
+                            token_amount = parsed_data.get("tokenAmount", {})
+                            amount = token_amount.get("amount", "0")
+                            decimals = token_amount.get("decimals", 0)
+                            ui_amount = token_amount.get("uiAmount", 0)
+                            
+                            # Skip zero balance tokens
+                            if ui_amount == 0:
+                                continue
+                            
+                            # Get token info
+                            token_info = tokens_by_address.get(mint, {})
+                            
+                            # Get price
+                            price = get_token_price(mint)
+                            value_usd = (ui_amount * price) if price else None
+                            
+                            token_accounts.append({
+                                "mint": mint,
+                                "symbol": token_info.get("symbol"),
+                                "name": token_info.get("name"),
+                                "amount": amount,
+                                "decimals": decimals,
+                                "uiAmount": ui_amount,
+                                "price_usd": price,
+                                "value_usd": value_usd
+                            })
+                    except Exception as e:
+                        logger.error(f"Error parsing token account: {e}")
+                        continue
+        except Exception as e:
+            logger.error(f"Error fetching token accounts: {e}")
+        
+        return WalletInfo(
+            public_key=address,
+            sol_balance=sol_balance,
+            lamports=lamports,
+            tokens=token_accounts
+        )
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error fetching token accounts: {e}")
-    
-    return WalletInfo(
-        public_key=address,
-        sol_balance=sol_balance,
-        lamports=lamports,
-        tokens=token_accounts
-    )
+        logger.error(f"Error in get_wallet_info_by_address: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/swap")
 async def swap_tokens(request: SwapRequest):
@@ -460,7 +488,9 @@ async def swap_tokens(request: SwapRequest):
             f"&swapMode=ExactIn"
         )
         
+        logger.info(f"Getting quote: {quote_url}")
         quote_resp = requests.get(quote_url, timeout=10)
+        
         if quote_resp.status_code != 200:
             detail = f"Jupiter quote error: {quote_resp.status_code}"
             try:
@@ -570,11 +600,13 @@ async def swap_tokens(request: SwapRequest):
         except HTTPException:
             raise
         except Exception as e:
+            logger.error(f"Transaction error: {e}")
             raise HTTPException(status_code=500, detail=f"Transaction error: {str(e)}")
             
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Swap error: {e}")
         raise HTTPException(status_code=500, detail=f"Swap error: {str(e)}")
 
 # Error handlers
@@ -595,7 +627,7 @@ async def server_error_handler(request: Request, exc: Exception):
 # General exception handler
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    print(f"Unhandled exception: {exc}")
+    logger.error(f"Unhandled exception: {exc}")
     return JSONResponse(
         status_code=500,
         content={"error": "Internal server error", "detail": str(exc)}
@@ -604,5 +636,5 @@ async def general_exception_handler(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    print(f"Starting server on port {port}")
+    logger.info(f"Starting server on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
