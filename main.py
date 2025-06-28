@@ -193,17 +193,10 @@ def get_token_info(query: str):
 
 @app.post("/swap")
 def swap_tokens(request: SwapRequest):
+        """
+    Swap tokens using the Jupiter aggregator. Provide input/output tokens, amount, and slippage. Returns a signed or unsigned transaction.
     """
-    Perform a token swap from input_token to output_token using Jupiter aggregator.
-    Expects a JSON body with:
-    {
-      "input_token": "<symbol or mint address>",
-      "output_token": "<symbol or mint address>",
-      "amount": <float amount of input token>,
-      "slippage_bps": <int slippage in basis points>
-    }
-    Returns the transaction signature (ID) after sending the swap, or the unsigned swap transaction if no private key is configured.
-    """
+
     # Determine input and output mint addresses from symbols or addresses
     def resolve_token(token_str: str) -> (str, int):
         """Helper to resolve a token symbol/name/address to a mint address and decimals."""
