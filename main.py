@@ -1,7 +1,7 @@
 import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+# Note: JSONResponse import removed as it was not used
 import requests
 from typing import List, Optional
 from pydantic import BaseModel
@@ -99,15 +99,15 @@ def fetch_price_from_coingecko_by_contract(mint_address: str) -> Optional[TokenP
     except Exception:
         return None
 
-def search_coingecko_symbol(symbol: str) -> Optional[str]:
+def search_coingecko_symbol(query: str) -> Optional[str]:
     """Find CoinGecko coin ID by symbol or name."""
-    url = f"https://api.coingecko.com/api/v3/search?query={symbol}"
+    url = f"https://api.coingecko.com/api/v3/search?query={query}"
     try:
         resp = requests.get(url, timeout=5)
         results = resp.json().get("coins", [])
         # Try exact match on symbol or name
         for coin in results:
-            if coin.get("symbol", "").lower() == symbol.lower() or coin.get("name", "").lower() == symbol.lower():
+            if coin.get("symbol", "").lower() == query.lower() or coin.get("name", "").lower() == query.lower():
                 return coin.get("id")
         # Fallback to first result if no exact match
         if results:
@@ -128,7 +128,7 @@ def fetch_price_from_helius(mint_address: str) -> Optional[TokenPriceResponse]:
         result = resp.json().get("result", {})
         token_info = result.get("content", {}).get("token_info", {})
         price_info = token_info.get("price_info", {})
-        if price_info:
+        if price_info and price_info.get("price_per_token") is not None:
             return TokenPriceResponse(
                 symbol=token_info.get("symbol"),
                 mint=mint_address,
@@ -155,15 +155,15 @@ def get_token_price(token: str):
     Get the current price of a token by symbol or mint address.
     Returns price (USD), 24h volume, and market cap if available.
     """
-    # Determine if input is a symbol or a mint address
     symbol_query = None
     mint_address = None
     if is_solana_address(token):
         mint_address = token
     else:
+        # Treat input as a token symbol or name
         symbol_query = token.strip().upper()
+        # Special-case: "SOL" refers to the Solana coin
         if symbol_query == "SOL":
-            # Solana native token – use CoinGecko ID
             coingecko_id = "solana"
         else:
             coingecko_id = search_coingecko_symbol(symbol_query)
@@ -172,7 +172,7 @@ def get_token_price(token: str):
             if price_data:
                 price_data.symbol = symbol_query  # attach the symbol for reference
                 return price_data
-        # If not found on CoinGecko, try to resolve via Helius (symbol to mint)
+        # If not found on CoinGecko, try to resolve symbol to a mint via Helius
         if HELIUS_RPC_URL:
             payload = {
                 "jsonrpc": "2.0", "id": 1, "method": "searchAssets",
@@ -187,28 +187,28 @@ def get_token_price(token: str):
             except Exception:
                 mint_address = None
     if mint_address:
-        # First try CoinGecko by contract address
+        # Try CoinGecko by contract address
         price_data = fetch_price_from_coingecko_by_contract(mint_address)
         if price_data:
             if symbol_query:
-                price_data.symbol = symbol_query
+                price_data.symbol = symbol_query  # include original symbol if available
             return price_data
-        # Next try Helius direct
+        # Try Helius direct
         price_data = fetch_price_from_helius(mint_address)
         if price_data:
             return price_data
-    # If we reach here, no price was found
+    # If no price found from any source:
     raise HTTPException(status_code=404, detail="Token price not found.")
 
 @app.get("/wallet/{address}", response_model=WalletBalanceResponse)
 def get_wallet_balance(address: str):
     """
     Get SOL balance and SPL token balances for a given wallet address.
-    Returns SOL balance and list of tokens with balances and USD values.
+    Returns SOL balance and a list of tokens with balances and USD values.
     """
     if not is_solana_address(address):
         raise HTTPException(status_code=400, detail="Invalid Solana wallet address.")
-    # Fetch native SOL balance
+    # Fetch native SOL balance (lamports -> SOL)
     rpc_url = HELIUS_RPC_URL if HELIUS_RPC_URL else SOLANA_RPC_URL
     try:
         resp = requests.post(rpc_url, json={"jsonrpc":"2.0","id":1,"method":"getBalance","params":[address]}, timeout=5)
@@ -217,7 +217,7 @@ def get_wallet_balance(address: str):
     except Exception:
         raise HTTPException(status_code=502, detail="Failed to fetch SOL balance.")
     tokens: List[TokenBalance] = []
-    # Try using Helius to get all token holdings (with prices)
+    # Use Helius to get all fungible token holdings (with prices if available)
     if HELIUS_RPC_URL:
         payload = {
             "jsonrpc": "2.0", "id": 1, "method": "searchAssets",
@@ -231,22 +231,23 @@ def get_wallet_balance(address: str):
                 mint = asset.get("id")
                 symbol = token_info.get("symbol")
                 decimals = token_info.get("decimals", 0)
-                balance_raw = token_info.get("balance", 0)  # raw balance (smallest units)
+                balance_raw = token_info.get("balance", 0)  # raw balance in smallest units
                 balance = balance_raw / (10 ** decimals) if decimals else balance_raw
-                usd_value = None
                 price_info = token_info.get("price_info")
+                usd_value = None
                 if price_info and price_info.get("price_per_token") is not None:
                     usd_value = price_info["price_per_token"] * balance
                 tokens.append(TokenBalance(mint=mint, symbol=symbol, balance=balance, usd_value=usd_value))
         except Exception:
-            tokens = []  # if Helius fails, we will do manual method
-    if not tokens:  # Helius not used or failed, fallback to RPC method
+            tokens = []  # fall back to RPC method if Helius fails
+    if not tokens:
+        # Fallback: get token accounts via Solana RPC and compute balances
         try:
             resp = requests.post(SOLANA_RPC_URL, json={
                 "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
                 "params": [
                     address,
-                    {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},  # Token Program ID
+                    {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},  # SPL Token Program
                     {"encoding": "jsonParsed"}
                 ]
             }, timeout=8)
@@ -258,20 +259,19 @@ def get_wallet_balance(address: str):
                 info = acct.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
                 mint = info.get("mint")
                 token_amount = info.get("tokenAmount", {})
+                # uiAmount is the token balance in regular units (float or int)
                 balance = float(token_amount.get("uiAmount", 0))
                 if balance is None or balance == 0:
-                    continue  # skip zero-balance accounts
-                # Fetch price for this token (contract or helius)
-                price = None
+                    continue  # skip empty accounts
+                # Fetch token price (if available) using contract address or Helius
                 pd = fetch_price_from_coingecko_by_contract(mint) or fetch_price_from_helius(mint)
-                if pd:
-                    price = pd.price
-                usd_value = price * balance if (price is not None) else None
+                price = pd.price if pd else None
+                usd_value = (price * balance) if price is not None else None
                 symbol = pd.symbol if (pd and pd.symbol) else None
                 tokens.append(TokenBalance(mint=mint, symbol=symbol, balance=balance, usd_value=usd_value))
             except Exception:
                 continue
-    # Sort tokens by USD value (if available), descending
+    # Sort tokens by USD value (highest first), unknown prices treated as 0
     tokens.sort(key=lambda t: (t.usd_value or 0), reverse=True)
     return WalletBalanceResponse(address=address, sol_balance=sol_balance, tokens=tokens)
 
@@ -279,21 +279,21 @@ def get_wallet_balance(address: str):
 def get_swap_quote(input_mint: str, output_mint: str, amount: float, slippage_bps: int = 50):
     """
     Simulate a token swap via Jupiter aggregator.
-    Returns the quote (route details, expected output, price impact) and a link to execute the swap.
+    Returns a quote with expected output, price impact, route plan, and a Jupiter swap link.
     """
     # Handle "SOL" keyword by substituting with wSOL mint address
     in_mint = WSOL_MINT if input_mint.strip().upper() == "SOL" else input_mint
     out_mint = WSOL_MINT if output_mint.strip().upper() == "SOL" else output_mint
     if not is_solana_address(in_mint) or not is_solana_address(out_mint):
         raise HTTPException(status_code=400, detail="Invalid input or output mint address.")
-    # Determine decimals of input token to convert amount to minor units
+    # Determine decimals for input token to calculate minor (atomic) amount
     decimals = 9 if input_mint.strip().upper() == "SOL" else get_token_decimals(in_mint)
     if decimals is None:
         raise HTTPException(status_code=400, detail="Unable to fetch token decimals for input mint.")
     minor_amount = int(amount * (10 ** decimals))
     if minor_amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be greater than 0.")
-    # Fetch quote from Jupiter API
+    # Fetch quote from Jupiter API (v6)
     quote_url = (f"https://quote-api.jup.ag/v6/quote?inputMint={in_mint}"
                  f"&outputMint={out_mint}&amount={minor_amount}&slippageBps={slippage_bps}")
     try:
@@ -302,9 +302,9 @@ def get_swap_quote(input_mint: str, output_mint: str, amount: float, slippage_bp
     except Exception:
         raise HTTPException(status_code=502, detail="Failed to fetch quote from Jupiter API.")
     if "error" in quote:
-        # Jupiter API can return an "error" key for invalid pairs, etc.
+        # Jupiter returns an "error" field if the pair is not swappable or other issues
         raise HTTPException(status_code=502, detail=f"Jupiter API error: {quote.get('error')}")
-    # Build response object with relevant fields
+    # Build response based on Jupiter quote
     result = {
         "inputMint": quote.get("inputMint", in_mint),
         "outputMint": quote.get("outputMint", out_mint),
