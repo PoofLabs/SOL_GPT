@@ -191,10 +191,11 @@ def get_token_info(query: str):
         raise HTTPException(status_code=404, detail="Token not found.")
     return token_matches
 
+
 @app.post("/swap")
 def swap_tokens(request: SwapRequest):
-        """
-    Swap tokens using the Jupiter aggregator. Provide input/output tokens, amount, and slippage. Returns a signed or unsigned transaction.
+    """
+    Perform token swap using Jupiter aggregator. Returns transaction signature or unsigned transaction if no private key configured.
     """
 
     # Determine input and output mint addresses from symbols or addresses
