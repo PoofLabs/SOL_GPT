@@ -24,10 +24,14 @@ load_dotenv()
 # Configuration from environment
 RPC_URL = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
 PRIVATE_KEY_STR = os.environ.get("PRIVATE_KEY")  # Base58-encoded or JSON-array string of 64-byte private key
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://sol-gpt.onrender.com")  # Your deployed API URL
 
-# Initialize FastAPI app
-app = FastAPI(title="Solana Token API", 
-              description="Query Solana wallet, token info, and perform token swaps.")
+# Initialize FastAPI app with explicit servers configuration
+app = FastAPI(
+    title="Solana Token API", 
+    description="Query Solana wallet, token info, and perform token swaps.",
+    servers=[{"url": API_BASE_URL}]
+)
 
 # Enable CORS for all origins (optional, for client flexibility)
 app.add_middleware(
