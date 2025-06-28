@@ -1,5 +1,8 @@
-fastapi==0.95.2
-uvicorn==0.27.1
-requests==2.31.0
-pydantic==1.10.14
-python-dotenv==1.0.1
+fastapi==0.99.1         # FastAPI version compatible with Pydantic v1
+uvicorn==0.22.0         # ASGI server to run the app (tested version)
+pydantic==1.10.14       # Pydantic v1 (avoid v2 for compatibility)
+requests==2.31.0        # HTTP client for external API calls
+python-dotenv==1.0.0    # For loading .env files (if configuration in .env)
+base58==2.1.1           # Base58 encoding/decoding (for Solana addresses and keys)
+solana==0.36.7          # Solana Python SDK for RPC calls
+solders==0.26.0         # Solders for handling Solana transactions (ensure compatibility with solana)
