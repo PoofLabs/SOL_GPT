@@ -1,6 +1,7 @@
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from decimal import Decimal, getcontext
@@ -35,9 +36,15 @@ getcontext().prec = 20
 app = FastAPI(
     title="Solana Token API",
     description="Query Solana wallet, token info, and perform token swaps.",
-    version="1.0.0",
-    servers=[{"url": API_BASE_URL}]
+    version="1.0.0"
 )
+
+# Add the OpenAPI schema URL
+@app.get("/openapi.json")
+async def get_openapi():
+    openapi_schema = app.openapi()
+    openapi_schema["servers"] = [{"url": API_BASE_URL}]
+    return openapi_schema
 
 # Enable CORS
 app.add_middleware(
@@ -90,6 +97,7 @@ tokens_by_symbol = {}
 tokens_by_address = {}
 
 try:
+    print("Loading token list...")
     resp = requests.get(TOKEN_LIST_URL, timeout=10)
     resp.raise_for_status()
     token_list_json = resp.json()
@@ -142,8 +150,8 @@ def get_token_price(mint_address: str) -> Optional[float]:
             price_data = data.get("data", {}).get(mint_address)
             if price_data:
                 return price_data.get("price")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error getting price for {mint_address}: {e}")
     return None
 
 def resolve_token(token_str: str) -> tuple[str, int]:
@@ -197,7 +205,7 @@ def resolve_token(token_str: str) -> tuple[str, int]:
 
 # API Endpoints
 @app.get("/")
-def root():
+async def root():
     """Health check endpoint"""
     info = {
         "message": "Solana Token API is running",
@@ -216,7 +224,7 @@ def root():
     return info
 
 @app.get("/token", response_model=List[TokenInfo])
-def get_token_info(query: str):
+async def get_token_info(query: str):
     """Get token information by symbol, name, or mint address"""
     query_str = query.strip()
     if not query_str:
@@ -303,7 +311,7 @@ def get_token_info(query: str):
     return token_matches
 
 @app.get("/price/{token}", response_model=PriceInfo)
-def get_token_price_info(token: str):
+async def get_token_price_info(token: str):
     """Get detailed price information for a token"""
     try:
         # Resolve token to address
@@ -340,15 +348,15 @@ def get_token_price_info(token: str):
         raise HTTPException(status_code=500, detail=f"Error fetching price: {str(e)}")
 
 @app.get("/wallet", response_model=WalletInfo)
-def get_configured_wallet_info():
+async def get_configured_wallet_info():
     """Get information about the configured wallet"""
     if not solana_pubkey_str:
         raise HTTPException(status_code=404, detail="No wallet configured on server.")
     
-    return get_wallet_info_by_address(solana_pubkey_str)
+    return await get_wallet_info_by_address(solana_pubkey_str)
 
 @app.get("/wallet/{address}", response_model=WalletInfo)
-def get_wallet_info_by_address(address: str):
+async def get_wallet_info_by_address(address: str):
     """Get information about any wallet by address"""
     # Validate address
     try:
@@ -393,6 +401,10 @@ def get_wallet_info_by_address(address: str):
                         decimals = token_amount.get("decimals", 0)
                         ui_amount = token_amount.get("uiAmount", 0)
                         
+                        # Skip zero balance tokens
+                        if ui_amount == 0:
+                            continue
+                        
                         # Get token info
                         token_info = tokens_by_address.get(mint, {})
                         
@@ -424,7 +436,7 @@ def get_wallet_info_by_address(address: str):
     )
 
 @app.post("/swap")
-def swap_tokens(request: SwapRequest):
+async def swap_tokens(request: SwapRequest):
     """Perform a token swap using Jupiter aggregator"""
     try:
         # Resolve tokens
@@ -567,13 +579,30 @@ def swap_tokens(request: SwapRequest):
 
 # Error handlers
 @app.exception_handler(404)
-async def not_found_handler(request, exc):
-    return {"error": "Not found", "detail": str(exc.detail)}
+async def not_found_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=404,
+        content={"error": "Not found", "detail": str(exc.detail)}
+    )
 
 @app.exception_handler(500)
-async def server_error_handler(request, exc):
-    return {"error": "Internal server error", "detail": "An unexpected error occurred"}
+async def server_error_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error", "detail": "An unexpected error occurred"}
+    )
+
+# General exception handler
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    print(f"Unhandled exception: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error", "detail": str(exc)}
+    )
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Starting server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
