@@ -381,3 +381,8 @@ def simulate_swap(input_mint: str, output_mint: str, amount: float):
         "route": route_str,
         "platform": "Jupiter Aggregator"
     }
+    
+    @app.get("/")
+def root():
+    return {"message": "SolanaGPT online — try /wallet/{address}, /price/{symbol}, or /docs"}
+
