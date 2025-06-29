@@ -6,8 +6,9 @@ app = FastAPI(
     title="SolanaGPT",
     description="Poof Labs Solana degen trading assistant",
     version="1.0",
-    servers=[{"url": "/"}] 
+    servers=[{"url": "https://sol-gpt.onrender.com"}]  # 🧠 Full URL here
 )
+
 # Load Helius API key from environment (required for Helius DAS endpoints)
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 if not HELIUS_API_KEY:
