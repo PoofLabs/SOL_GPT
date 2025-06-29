@@ -2,8 +2,12 @@ from fastapi import FastAPI, HTTPException
 import requests
 import os
 
-app = FastAPI()
-
+app = FastAPI(
+    title="SolanaGPT",
+    description="Poof Labs Solana degenerate trading assistant",
+    version="1.0",
+    servers=[{"url": "/"}]  # ← this tells Swagger to use relative paths
+)
 # Load Helius API key from environment (required for Helius DAS endpoints)
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 if not HELIUS_API_KEY:
