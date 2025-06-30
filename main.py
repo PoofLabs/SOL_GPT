@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 from decimal import Decimal
@@ -18,7 +18,7 @@ app.add_middleware(
 )
 
 RPC_ENDPOINTS = [
-    "https://rpc.helius.xyz/?api-key=YOUR_API_KEY",
+    "https://rpc.helius.xyz/?api-key=cfa5bbd3-4880-4efe-87ac-319f7093cf7a",
     "https://mainnet.helius-rpc.com",
     "https://api.mainnet-beta.solana.com",
     "https://solana-api.projectserum.com",
@@ -47,6 +47,97 @@ def get_rpc_response(payload):
             continue
     raise Exception("All RPC endpoints failed or timed out")
 
+def format_amount(n: float) -> str:
+    """Format a number with K/M/B suffixes for readability."""
+    if n is None:
+        return "N/A"
+    try:
+        value = float(n)
+    except:
+        return "N/A"
+    if value >= 1_000_000_000:
+        return f"{value/1_000_000_000:.1f} B"
+    elif value >= 1_000_000:
+        return f"{value/1_000_000:.1f} M"
+    elif value >= 1_000:
+        return f"{value/1_000:.1f} k"
+    else:
+        # For values < 1000, use appropriate decimals
+        if value >= 100:
+            return f"{value:.0f}"
+        elif value >= 1:
+            return f"{value:.1f}"
+        else:
+            return f"{value:.2f}"
+
+@app.get("/swap")
+def simulate_swap(input_mint: str, output_mint: str, amount: float):
+    """Simulate a token swap using Jupiter aggregator and return quote details."""
+    # Prepare the raw amount for Jupiter (lamports for SOL, atomic units for others)
+    input_mint_addr = input_mint
+    output_mint_addr = output_mint
+    if input_mint_addr == "So11111111111111111111111111111111111111112":
+        # Convert SOL to lamports
+        raw_amount = int(amount * 1e9)
+    else:
+        # For other tokens, assume amount is already in smallest units (atomic) 
+        # (Better: fetch token decimals and convert)
+        try:
+            raw_amount = int(amount)
+        except Exception:
+            raw_amount = None
+    if raw_amount is None:
+        raise HTTPException(status_code=422, detail="Invalid amount")
+    # Construct Jupiter quote API URL
+    jup_url = (
+        "https://lite-api.jup.ag/quote"
+        f"?inputMint={input_mint_addr}&outputMint={output_mint_addr}"
+        f"&amount={raw_amount}&slippageBps=50&restrictIntermediateTokens=true"
+    )
+    # Request quote from Jupiter
+    try:
+        jresp = requests.get(jup_url, timeout=5)
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="Jupiter quote request failed")
+    if jresp.status_code != 200:
+        raise HTTPException(status_code=502, detail="Jupiter API returned error")
+    quote = jresp.json()
+    if not quote or "outAmount" not in quote:
+        raise HTTPException(status_code=502, detail="Invalid quote response")
+    # Parse quote data
+    in_amount_user = amount
+    out_amount = int(quote["outAmount"])
+    out_amount_str = f"{out_amount:,}"  # format with commas
+    # Build route representation
+    route_steps = []
+    for step in quote.get("routePlan", []):
+        swap_info = step.get("swapInfo", {})
+        imint = swap_info.get("inputMint")
+        omint = swap_info.get("outputMint")
+        # Convert mint addresses to symbols or short tags
+        def mint_to_symbol(mint_addr: str) -> str:
+            known = {
+                "So11111111111111111111111111111111111111112": "SOL",
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
+                "Es9vMFrzaCjLwSX5ae4Ew9WVeEKXZotPwX3hPJJrEvDw": "USDT"
+            }
+            if mint_addr in known:
+                return known[mint_addr]
+            return f"{mint_addr[:4]}…{mint_addr[-3:]}" if mint_addr else "UNK"
+        symbol_in = mint_to_symbol(imint)
+        route_steps.append(symbol_in)
+    if route_steps:
+        # Append final output token symbol
+        route_steps.append(mint_to_symbol(output_mint_addr))
+    route_str = " -> ".join(route_steps)
+    slippage_pct = 0.5  # 50 bps = 0.5%
+    return {
+        "input_amount": f"{in_amount_user} {route_steps[0]}",
+        "output_estimate": f"{out_amount_str} {route_steps[-1]}",
+        "slippage": f"{slippage_pct}%",
+        "route": route_str,
+        "platform": "Jupiter Aggregator"
+    }
 
 @app.get("/balances/{address}")
 def get_balances(address: str):
@@ -243,94 +334,11 @@ def get_transaction(signature: str):
     summary = "\n".join(summary_lines) if summary_lines else "No parsed instruction details available."
     return {"signature": signature, "summary": summary}
 
-@app.get("/swap")
-def simulate_swap(input_mint: str, output_mint: str, amount: float):
-    """Simulate a token swap using Jupiter aggregator and return quote details."""
-    # Construct Jupiter quote API URL. Amount for Jupiter must be in smallest units (integer).
-    # We assume 'amount' is given in the input token's natural unit (e.g., SOL).
-    # For SOL (mint So111...12) Jupiter expects amount in lamports.
-    # For SPL tokens, amount should be in base units (according to their decimals).
-    # **Note**: This simple implementation cannot dynamically fetch token decimals,
-    # so it assumes the amount is already in base units if not SOL.
-    # If input is SOL, convert to lamports:
-    input_mint_addr = input_mint
-    output_mint_addr = output_mint
-    raw_amount = None
-    # Special-case: if input mint is the canonical SOL address, multiply by 1e9
-    if input_mint_addr == "So11111111111111111111111111111111111111112":
-        raw_amount = int(amount * 1e9)
-    else:
-        # Otherwise, assume amount is already in the smallest unit for simplicity
-        # (In a real scenario, we would lookup the input token's decimals and do scaling)
-        try:
-            raw_amount = int(amount)
-        except Exception:
-            raw_amount = None
-    if raw_amount is None:
-        raise HTTPException(status_code=422, detail="Invalid amount")
-    jup_url = (
-        "https://lite-api.jup.ag/quote"
-        f"?inputMint={input_mint_addr}&outputMint={output_mint_addr}"
-        f"&amount={raw_amount}&slippageBps=50&restrictIntermediateTokens=true"
-    )
-    try:
-        jresp = requests.get(jup_url, timeout=5)
-    except requests.RequestException:
-        raise HTTPException(status_code=502, detail="Jupiter quote request failed")
-    if jresp.status_code != 200:
-        raise HTTPException(status_code=502, detail="Jupiter API returned error")
-    quote = jresp.json()
-    if not quote or "outAmount" not in quote:
-        raise HTTPException(status_code=502, detail="Invalid quote response")
-    # Parse the quote data
-    in_amount_user = amount  # the input amount as provided (in SOL or token units)
-    out_amount = int(quote["outAmount"])
-    # If possible, convert out_amount to token units by applying output token decimals.
-    # (Here we don't know decimals of output; assume it is already smallest unit if from Jupiter.)
-    out_amount_str = f"{out_amount:,}"  # raw output amount with commas (if no decimal info)
-    # Route parsing:
-    route_steps = []
-    route_plan = quote.get("routePlan", [])
-    for step in route_plan:
-        swap_info = step.get("swapInfo", {})
-        imint = swap_info.get("inputMint")
-        omint = swap_info.get("outputMint")
-        # Use known common tokens for names, otherwise abbreviate mint
-        def mint_to_symbol(mint_addr: str) -> str:
-            # Known tokens mapping (extend as needed)
-            known = {
-                "So11111111111111111111111111111111111111112": "SOL",
-                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
-                "Es9vMFrzaCjLwSX5ae4Ew9WVeEKXZotPwX3hPJJrEvDw": "USDT"
-            }
-            if mint_addr in known:
-                return known[mint_addr]
-            # If not known, fallback to a short form of mint (e.g., first4…last3)
-            return f"{mint_addr[:4]}…{mint_addr[-3:]}" if mint_addr else "UNK"
-        symbol_in = mint_to_symbol(imint)
-        symbol_out = mint_to_symbol(omint)
-        route_steps.append(symbol_in)
-        # Only append the final output token in the very end (outside loop)
-        # (Intermediate tokens will be added in each iteration)
-    if route_steps:
-        final_out_symbol = mint_to_symbol(output_mint_addr)
-        route_steps.append(final_out_symbol)
-    route_str = " -> ".join(route_steps)
-    # Slippage (from the query parameter we fixed at 0.5%)
-    slippage_pct = 0.5
-    # Prepare simulation result
-    return {
-        "input_amount": f"{in_amount_user} {route_steps[0]}",
-        "output_estimate": f"{out_amount_str} {route_steps[-1]}",
-        "slippage": f"{slippage_pct}%",
-        "route": route_str,
-        "platform": "Jupiter Aggregator"
-    }
 @app.get("/price/{symbol}")
 def get_price(symbol: str):
     """Get current price, 24h change, volume (in SOL), and market cap for a token symbol."""
     symbol_query = symbol.strip().lower()
-    # Use CoinGecko's search to find the coin ID (to handle cases where symbol isn't unique)
+    # Find coin ID by symbol/name using CoinGecko
     search_url = f"https://api.coingecko.com/api/v3/search?query={symbol_query}"
     try:
         sresp = requests.get(search_url, timeout=5)
@@ -341,20 +349,19 @@ def get_price(symbol: str):
     search_data = sresp.json()
     coin_id = None
     if search_data and "coins" in search_data:
-        # Find an exact symbol match if possible
         for coin in search_data["coins"]:
             if coin.get("symbol", "").lower() == symbol_query:
                 coin_id = coin.get("id")
                 break
         if not coin_id and search_data["coins"]:
-            # Fallback to first search result
             coin_id = search_data["coins"][0].get("id")
     if not coin_id:
         raise HTTPException(status_code=404, detail="Token not found on CoinGecko")
-    # Fetch market data for the coin and for Solana in one call
+    # Fetch market data for the coin and for Solana (to convert volume to SOL)
+    ids_param = coin_id if coin_id == "solana" else f"{coin_id},solana"
     market_url = (
         "https://api.coingecko.com/api/v3/coins/markets"
-        f"?vs_currency=usd&ids={coin_id},solana&price_change_percentage=24h"
+        f"?vs_currency=usd&ids={ids_param}&price_change_percentage=24h"
     )
     try:
         mresp = requests.get(market_url, timeout=5)
@@ -363,69 +370,57 @@ def get_price(symbol: str):
     if mresp.status_code != 200:
         raise HTTPException(status_code=502, detail="CoinGecko market data error")
     market_data = mresp.json()
-    if not isinstance(market_data, list):
+    if not isinstance(market_data, list) or len(market_data) == 0:
         raise HTTPException(status_code=502, detail="Invalid market data response")
-    # Parse the coin and Solana data from the response list
+    # Parse coin and solana data
     coin_data = None
     sol_data = None
     for entry in market_data:
         if entry.get("id") == coin_id:
             coin_data = entry
-        elif entry.get("id") == "solana":
+        if entry.get("id") == "solana":
             sol_data = entry
     if not coin_data:
         raise HTTPException(status_code=502, detail="Coin data not found in response")
-    # Ensure we have Solana price for volume conversion; if not present, fetch separately
-    sol_price = None
-    if sol_data and "current_price" in sol_data:
-        sol_price = sol_data["current_price"]
-    else:
-        # Fallback: get SOL price via simple endpoint
+    # Get Solana price (for volume conversion to SOL)
+    sol_price = sol_data["current_price"] if (sol_data and "current_price" in sol_data) else None
+    if sol_price is None:
         try:
             sol_resp = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", timeout=3)
-            sol_price = sol_resp.json().get("solana", {}).get("usd") if sol_resp.status_code == 200 else None
-        except:
+            if sol_resp.status_code == 200:
+                sol_price = sol_resp.json().get("solana", {}).get("usd")
+        except requests.RequestException:
             sol_price = None
-    
-    # Extract required fields from coin_data
-    symbol_out = coin_data.get("symbol", symbol).upper()
+    # Extract and format required fields
+    symbol_out = coin_data.get("symbol", symbol_query).upper()
     price_usd = coin_data.get("current_price")
     change_pct = coin_data.get("price_change_percentage_24h")
-    volume_usd = coin_data.get("total_volume")  # 24h trading volume in USD
+    volume_usd = coin_data.get("total_volume")
     market_cap = coin_data.get("market_cap")
     if price_usd is None or change_pct is None or volume_usd is None or market_cap is None:
         raise HTTPException(status_code=502, detail="Incomplete data from CoinGecko")
-    # Format price with appropriate decimals
-    if price_usd >= 1:
-        price_str = f"${price_usd:.2f}"
-    elif price_usd >= 0.1:
-        price_str = f"${price_usd:.4f}"
-    else:
-        price_str = f"${price_usd:.6f}"
-    # Format change with one decimal and sign
+    # Format price and change
+    price_str = (
+        f"${price_usd:.2f}" if price_usd >= 1 
+        else f"${price_usd:.4f}" if price_usd >= 0.1 
+        else f"${price_usd:.6f}"
+    )
     change_str = f"{change_pct:+.1f}%"
-    # Convert volume USD to volume in SOL, and format with suffix
-    vol_sol = None
-    vol_str = None
+    # Format volume (convert USD to SOL volume if possible)
     if sol_price and sol_price > 0:
         vol_sol = volume_usd / sol_price
-        # Format volume in SOL with k/M suffix
         vol_str = format_amount(vol_sol) + " SOL"
     else:
-        # If SOL price unavailable, fall back to USD volume with suffix and $ (though not expected)
-        vol_str = format_amount(volume_usd) + " $"
-    # Format market cap with k/M/B (in USD, omit currency symbol as per style)
-    mc_str = None
-    if market_cap is not None:
-        if market_cap >= 1_000_000_000:
-            mc_str = f"{market_cap/1_000_000_000:.1f} B"
-        elif market_cap >= 1_000_000:
-            mc_str = f"{market_cap/1_000_000:.1f} M"
-        elif market_cap >= 1_000:
-            mc_str = f"{market_cap/1_000:.1f} k"
-        else:
-            mc_str = str(int(market_cap))
-    # Prepare response data
+        vol_str = format_amount(volume_usd) + " $"  # fallback to USD volume
+    # Format market cap
+    if market_cap >= 1_000_000_000:
+        mc_str = f"{market_cap/1_000_000_000:.1f} B"
+    elif market_cap >= 1_000_000:
+        mc_str = f"{market_cap/1_000_000:.1f} M"
+    elif market_cap >= 1_000:
+        mc_str = f"{market_cap/1_000:.1f} k"
+    else:
+        mc_str = str(int(market_cap))
     return {
         "symbol": symbol_out,
         "price": price_str,
@@ -482,8 +477,6 @@ def find_token(query: str):
         "name": name,
         "mint": sol_mint
     }
-
-
 
 @app.get("/")
 def root():
