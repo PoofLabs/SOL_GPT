@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 from decimal import Decimal
+from functools import lru_cache
+from random import shuffle
 
 app = FastAPI(
     title="SolanaGPT",
@@ -33,11 +35,34 @@ RPC_ENDPOINTS = [
 
 JUPITER_TOKEN_INFO_URL = "https://tokens.jup.ag/token/"
 JUPITER_PRICE_URL = "https://api.jup.ag/price/v2?ids="
+JUPITER_TOKEN_LIST_URL = "https://token.jup.ag/all"
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
+@lru_cache(maxsize=1)
+def get_jupiter_token_map():
+    try:
+        resp = requests.get(JUPITER_TOKEN_LIST_URL, timeout=10)
+        tokens = resp.json()
+        return {t['symbol'].lower(): t['address'] for t in tokens if 'symbol' in t and 'address' in t}
+    except Exception:
+        return {}
+
+def get_token_mint_from_symbol(symbol: str) -> str:
+    token_map = get_jupiter_token_map()
+    mint = token_map.get(symbol.lower())
+    if not mint:
+        raise HTTPException(status_code=404, detail=f"Mint not found for symbol '{symbol}'")
+    return mint
+
+def resolve_to_mint(token_input: str) -> str:
+    if len(token_input) > 30 and token_input.startswith("So"):
+        return token_input
+    return get_token_mint_from_symbol(token_input)
 
 def get_rpc_response(payload):
-    for url in RPC_ENDPOINTS:
+    rpc_list = RPC_ENDPOINTS[:]
+    shuffle(rpc_list)
+    for url in rpc_list:
         try:
             resp = requests.post(url, json=payload, timeout=5)
             data = resp.json()
@@ -138,6 +163,16 @@ def simulate_swap(input_mint: str, output_mint: str, amount: float):
         "route": route_str,
         "platform": "Jupiter Aggregator"
     }
+
+@app.get("/resolve")
+def resolve_symbol(symbol: str):
+    """Resolve a token symbol to its Solana mint address using Jupiter."""
+    try:
+        mint = resolve_to_mint(symbol)
+        return {"symbol": symbol.upper(), "mint": mint}
+    except HTTPException as e:
+        raise e
+
 
 @app.get("/balances/{address}")
 def get_balances(address: str):
