@@ -7,7 +7,7 @@ app = FastAPI(
     title="SolanaGPT",
     description="Poof Labs Solana degen trading assistant",
     version="1.0",
-    servers=[{"url": "https://sol-gpt.onrender.com"}]
+    servers=[{"url": "https://web-production-61325.up.railway.app"}]
 )
 
 app.add_middleware(
