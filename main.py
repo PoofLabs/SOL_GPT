@@ -557,6 +557,74 @@ def get_token_info_from_mint(mint: str):
         "name": name or "Unknown",
         "symbol": symbol or "Unknown"
     }
+import json
+
+PUMPFUN_GRAPHQL_URL = "https://prod-api.pump.fun/graphql"
+
+def fetch_pumpfun_tokens(limit=50):
+    """Fetch latest tokens from Pump.fun's GraphQL endpoint"""
+    query = {
+        "operationName": "Feed",
+        "variables": {"sortBy": "new", "limit": limit},
+        "query": """
+            query Feed($sortBy: String, $limit: Int) {
+              feed(sortBy: $sortBy, limit: $limit) {
+                id
+                name
+                symbol
+                createdAt
+                metadata {
+                  mint
+                  imageUri
+                }
+                stats {
+                  price
+                  marketCap
+                  volume24h
+                }
+              }
+            }
+        """
+    }
+    try:
+        resp = requests.post(PUMPFUN_GRAPHQL_URL, json=query, timeout=6)
+        if resp.status_code == 200:
+            return resp.json().get("data", {}).get("feed", [])
+        return []
+    except Exception:
+        return []
+
+@app.get("/pumpfun")
+def get_latest_pumpfun_tokens():
+    """List latest Pump.fun launches (basic info)"""
+    tokens = fetch_pumpfun_tokens()
+    return [
+        {
+            "name": t.get("name"),
+            "symbol": t.get("symbol"),
+            "mint": t.get("metadata", {}).get("mint"),
+            "price": t.get("stats", {}).get("price"),
+            "market_cap": t.get("stats", {}).get("marketCap"),
+            "volume_24h": t.get("stats", {}).get("volume24h")
+        }
+        for t in tokens if t.get("metadata", {}).get("mint")
+    ]
+
+@app.get("/pumpfun/{mint}")
+def get_pumpfun_token_by_mint(mint: str):
+    """Check if a given mint matches a Pump.fun token"""
+    tokens = fetch_pumpfun_tokens(200)  # search through more for better coverage
+    for t in tokens:
+        if t.get("metadata", {}).get("mint") == mint:
+            return {
+                "name": t.get("name"),
+                "symbol": t.get("symbol"),
+                "mint": mint,
+                "price": t.get("stats", {}).get("price"),
+                "market_cap": t.get("stats", {}).get("marketCap"),
+                "volume_24h": t.get("stats", {}).get("volume24h")
+            }
+    raise HTTPException(status_code=404, detail="Mint not found in Pump.fun listings")
 
 @app.get("/")
 def root():
