@@ -38,6 +38,35 @@ JUPITER_PRICE_URL = "https://api.jup.ag/price/v2?ids="
 JUPITER_TOKEN_LIST_URL = "https://token.jup.ag/all"
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
+def fetch_basic_token_info(mint: str):
+    """Fetch token account owner program (e.g. check if it's SPL)"""
+    payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "getAccountInfo",
+        "params": [mint, {"encoding": "jsonParsed"}]
+    }
+    try:
+        data = get_rpc_response(payload)
+        owner = data.get("result", {}).get("value", {}).get("owner")
+        return owner
+    except:
+        return None
+
+def helius_token_metadata(mint: str):
+    """Try to get richer metadata from Helius (if token is new or unknown)"""
+    try:
+        resp = requests.get(
+            f"https://api.helius.xyz/v0/tokens/metadata?mint={mint}&api-key=cfa5bbd3-4880-4efe-87ac-319f7093cf7a", 
+            timeout=5
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and data:
+                return data[0]  # get first result
+        return None
+    except:
+        return None
+
 @lru_cache(maxsize=1)
 def get_jupiter_token_map():
     try:
@@ -511,6 +540,22 @@ def find_token(query: str):
         "symbol": symbol,
         "name": name,
         "mint": sol_mint
+    }
+    
+@app.get("/mintinfo/{mint}")
+def get_token_info_from_mint(mint: str):
+    """Resolve metadata from mint address — for Pump.fun / raw tokens"""
+    owner = fetch_basic_token_info(mint)
+    meta = helius_token_metadata(mint)
+
+    name = meta.get("name") if meta else None
+    symbol = meta.get("symbol") if meta else None
+
+    return {
+        "mint": mint,
+        "owner": owner or "Unknown",
+        "name": name or "Unknown",
+        "symbol": symbol or "Unknown"
     }
 
 @app.get("/")
